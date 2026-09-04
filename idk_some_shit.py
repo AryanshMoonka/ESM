@@ -1,4 +1,4 @@
-
+##Copyright Reserved (2026) by Aryansh Moonka. All rights reserved. Unathorized copying, distribution, or modifications of this file, via any medium is strictly prohibited. Proprietary and confidential.
 
 import csv
 import io
@@ -175,11 +175,18 @@ def predict_structure_chunked(sequence: str, retries: int = 5) -> str:
 # ---------------------------------------------------------------------------
 # Fetching data
 # ---------------------------------------------------------------------------
-def fetch_experimental_pdb(pdb_id: str) -> str:
-    """Download the experimental structure file from RCSB."""
-    response = requests.get(PDB_FETCH_URL.format(pdb_id=pdb_id), timeout=30)
-    response.raise_for_status()
-    return response.text
+@st.cache_data
+def fetch_experimental_pdb(pdb_id: str, retries: int = 3) -> str:
+    last_error = None
+    for attempt in range(retries):
+        try:
+            response = requests.get(PDB_FETCH_URL.format(pdb_id=pdb_id), timeout=30)
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as error:
+            last_error = error
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"Failed to fetch experimental PDB for {pdb_id} after {retries} attempts: {last_error}")
 
 
 @st.cache_data
@@ -205,16 +212,39 @@ def is_likely_pathogen(pdb_id: str) -> bool:
 
 
 @st.cache_data
-def fetch_sequence(pdb_id: str) -> str:
+def fetch_sequence(pdb_id: str, chain: str = None) -> str:
     response = requests.get(PDB_SEQ_URL.format(pdb_id=pdb_id), timeout=30)
     response.raise_for_status()
     lines = response.text.strip().splitlines()
-    sequence_lines: List[str] = []
-    for line in lines[1:]:
+
+    records = {}
+    current_chains: List[str] = []
+    current_seq: List[str] = []
+
+    def flush():
+        if current_chains and current_seq:
+            seq = "".join(current_seq)
+            for c in current_chains:
+                records[c] = seq
+
+    for line in lines:
         if line.startswith(">"):
-            break
-        sequence_lines.append(line.strip())
-    return "".join(sequence_lines)
+            flush()
+            current_seq = []
+            header = line[1:]
+            chain_part = header.split("|")[1] if "|" in header else ""
+            chain_part = chain_part.replace("Chains", "").replace("Chain", "")
+            current_chains = [c.strip() for c in chain_part.split(",") if c.strip()]
+        else:
+            current_seq.append(line.strip())
+    flush()
+
+    if chain is not None:
+        if chain not in records:
+            raise ValueError(f"Chain {chain} not found in FASTA for {pdb_id}")
+        return records[chain]
+
+    return next(iter(records.values()))
 
 @st.cache_data
 def predict_structure(sequence, retries=5):
@@ -304,6 +334,7 @@ def get_protein_chains(pdb_id: str) -> list:
     protein_chains = [c for c in all_chains if is_protein_chain(experimental_pdb, c)]
     for c in set(all_chains) - set(protein_chains):
         print(f"[{pdb_id}] Skipping chain {c}: nucleic acid or non-protein, not scoreable by ESMFold.")
+    print(f"DEBUG [{pdb_id}]: all_chains={all_chains}, protein_chains={protein_chains}")
     return protein_chains
 
 
@@ -468,7 +499,7 @@ def benchmark_all_chains(pdb_id: str) -> list:
 def get_chain_prediction(pdb_id: str, chain: str):
     experimental_pdb = fetch_experimental_pdb(pdb_id)
     exp_coords = extract_ca_coordinates(experimental_pdb, chain=chain)
-    sequence = fetch_sequence(pdb_id)
+    sequence = fetch_sequence(pdb_id, chain=chain)
     predicted_pdb = predict_structure(sequence)
     pred_coords = extract_ca_coordinates(predicted_pdb)
     length = min(len(exp_coords), len(pred_coords))
@@ -484,6 +515,7 @@ def benchmark_quaternary(pdb_id: str):
     for c in chain_ids:
         exp, pred = get_chain_prediction(pdb_id, c)
         chain_data[c] = {"exp": exp, "pred": pred}
+    print(f"DEBUG [{pdb_id}] chain {c}: exp_coords len={len(exp)}, pred_coords len={len(pred)}")
 
     ref_chain = chain_ids[0]
     rotation, mean_a, mean_b = kabsch_transform(
@@ -520,21 +552,27 @@ def benchmark_quaternary(pdb_id: str):
 # SASA / pLDDT / epitope analysis
 # ---------------------------------------------------------------------------
 def compute_sasa(pdb_text: str, chain: str = None):
+    """Simplified SASA proxy using neighbour count — works on ESMFold output."""
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("x", io.StringIO(pdb_text))
-    sr = ShrakeRupley()
-    sr.compute(structure, level="R")
-    sasa_by_residue = []
+    ca_coords = []
     for model in structure:
         for c in model:
             if chain and c.id != chain:
                 continue
             for residue in c:
                 if residue.has_id("CA"):
-                    sasa_by_residue.append(residue.sasa)
+                    ca_coords.append(residue["CA"].get_vector().get_array())
         break
-    return sasa_by_residue
-
+    if not ca_coords:
+        return []
+    ca_coords = np.array(ca_coords)
+    sasa_proxy = []
+    for i, coord in enumerate(ca_coords):
+        distances = np.linalg.norm(ca_coords - coord, axis=1)
+        neighbours = np.sum(distances < 10.0) - 1
+        sasa_proxy.append(max(0.0, 100.0 - neighbours * 8.0))
+    return sasa_proxy
 
 def extract_plddt(pdb_text: str, chain: str = None):
     """ESMFold stores per-residue pLDDT in the B-factor column."""
@@ -553,23 +591,27 @@ def extract_plddt(pdb_text: str, chain: str = None):
         if res_num in seen_residues:
             continue
         seen_residues.add(res_num)
-        bfactor = float(line[60:66])
+        try:
+            bfactor = float(line[60:66].strip())
+        except ValueError:
+            bfactor = 0.0
         plddt.append(bfactor)
     return plddt
 
 
-def find_epitope_candidates(pdb_id: str, chain: str, sasa_threshold=30.0, plddt_threshold=70.0):
+def find_epitope_candidates(pdb_id: str, chain: str, sasa_threshold=30.0, plddt_threshold=0.7):
     """Flag residues that are both surface-exposed AND confidently predicted."""
-    sequence = fetch_sequence(pdb_id)
+    sequence = fetch_sequence(pdb_id, chain=chain)
     predicted_pdb = predict_structure(sequence)
     sasa = compute_sasa(predicted_pdb, chain=None)  # predicted structure is single-chain
+    print(f"SASA raw values: {sasa[:10]}")
     plddt = extract_plddt(predicted_pdb, chain=None)
-
+    print(f"pLDDT raw values: {plddt[:10]}")
     length = min(len(sasa), len(plddt))
     candidates = []
     for i in range(length):
-        if sasa[i] > sasa_threshold and plddt[i] > plddt_threshold:
-            candidates.append({"residue_index": i + 1, "sasa": round(sasa[i], 1), "plddt": round(plddt[i], 1)})
+     if sasa[i] > sasa_threshold and plddt[i] >= plddt_threshold:
+            candidates.append({"residue_index": i + 1, "sasa": round(sasa[i], 1), "plddt": round(plddt[i] if i < len(plddt) else 0.0, 1)})
     return candidates
 
 
@@ -600,32 +642,108 @@ def find_glycosylation_sites(sequence: str) -> list:
         sites.append(match.start() + 1)  # 1-indexed residue position
     return sites
 
+# ---------------------------------------------------------------------------
+# Epitope propensity scales (Kyte-Doolittle hydrophilicity, Parker, Karplus-Schulz flexibility)
+# ---------------------------------------------------------------------------
 
-def analyze_novel_sequence(sequence: str, sasa_threshold=30.0, plddt_threshold=70.0) -> dict:
+# Kyte-Doolittle hydrophobicity (LOWER = more hydrophilic = more epitope-likely)
+KYTE_DOOLITTLE = {
+    'A': 1.8, 'R': -4.5, 'N': -3.5, 'D': -3.5, 'C': 2.5,
+    'Q': -3.5, 'E': -3.5, 'G': -0.4, 'H': -3.2, 'I': 4.5,
+    'L': 3.8, 'K': -3.9, 'M': 1.9, 'F': 2.8, 'P': -1.6,
+    'S': -0.8, 'T': -0.7, 'W': -0.9, 'Y': -1.3, 'V': 4.2
+}
+
+# Parker hydrophilicity (HIGHER = more epitope-likely)
+PARKER_HYDROPHILICITY = {
+    'A': 2.1, 'R': 4.2, 'N': 7.0, 'D': 10.0, 'C': 1.4,
+    'Q': 6.0, 'E': 7.8, 'G': 5.7, 'H': 2.1, 'I': -8.0,
+    'L': -9.2, 'K': 5.7, 'M': -4.2, 'F': -9.2, 'P': 2.1,
+    'S': 6.5, 'T': 5.2, 'W': -10.0, 'Y': -1.9, 'V': -3.7
+}
+
+# Karplus-Schulz flexibility (HIGHER = more flexible = more epitope-likely)
+KARPLUS_SCHULZ_FLEXIBILITY = {
+    'A': 0.984, 'R': 1.008, 'N': 1.048, 'D': 1.068, 'C': 0.906,
+    'Q': 1.037, 'E': 1.094, 'G': 1.031, 'H': 0.950, 'I': 0.927,
+    'L': 0.935, 'K': 1.102, 'M': 0.952, 'F': 0.915, 'P': 1.049,
+    'S': 1.046, 'T': 0.997, 'W': 0.904, 'Y': 0.929, 'V': 0.931
+}
+
+def _normalize(values: list) -> list:
+    """Min-max normalize a list of floats to 0-1 range."""
+    if not values:
+        return []
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        return [0.5 for _ in values]
+    return [(v - lo) / (hi - lo) for v in values]
+
+def compute_epitope_scores(sequence: str, sasa: list, plddt: list) -> list:
+    """
+    Combine SASA, pLDDT, hydrophilicity, and flexibility into a single
+    per-residue epitope propensity score (0-1, higher = more epitope-likely).
+    """
+    length = min(len(sequence), len(sasa), len(plddt))
+
+    hydrophobicity = [KYTE_DOOLITTLE.get(sequence[i], 0.0) for i in range(length)]
+    hydrophilicity_raw = [-h for h in hydrophobicity]  # flip sign: lower hydrophobicity = more hydrophilic
+    flexibility = [KARPLUS_SCHULZ_FLEXIBILITY.get(sequence[i], 1.0) for i in range(length)]
+
+    sasa_n = _normalize(sasa[:length])
+    plddt_n = plddt[:length]  # already 0-1 scale
+    hydrophilicity_n = _normalize(hydrophilicity_raw)
+    flexibility_n = _normalize(flexibility)
+
+    # Weighted combination — weights can be tuned against IEDB validation later
+    weights = {"sasa": 0.35, "plddt": 0.20, "hydrophilicity": 0.30, "flexibility": 0.15}
+
+    scores = []
+    for i in range(length):
+        score = (
+            weights["sasa"] * sasa_n[i] +
+            weights["plddt"] * plddt_n[i] +
+            weights["hydrophilicity"] * hydrophilicity_n[i] +
+            weights["flexibility"] * flexibility_n[i]
+        )
+        scores.append(round(score, 4))
+    return scores
+
+def analyze_novel_sequence(sequence: str, sasa_threshold=30.0, plddt_threshold=0.7, min_length=5, max_gap=1) -> dict:
     """Full pipeline for a sequence with no known experimental structure."""
-    predicted_pdb = predict_structure(sequence)  # uses existing chunking logic automatically
+    predicted_pdb = predict_structure(sequence)
     sasa = compute_sasa(predicted_pdb, chain=None)
     plddt = extract_plddt(predicted_pdb, chain=None)
-
     length = min(len(sasa), len(plddt))
     candidates = []
+    print(f"NOVEL SEQ: length={len(sequence)}")
+    print(f"SASA raw values (first 20): {sasa[:20]}")
+    print(f"SASA max={max(sasa) if sasa else 'empty'}, min={min(sasa) if sasa else 'empty'}")
+    print(f"pLDDT raw values (first 20): {plddt[:20]}")
     for i in range(length):
-        if sasa[i] > sasa_threshold and plddt[i] > plddt_threshold:
-            candidates.append({"residue_index": i + 1, "sasa": round(sasa[i], 1), "plddt": round(plddt[i], 1)})
-
+            if sasa[i] > sasa_threshold and plddt[i] >= plddt_threshold:
+                candidates.append({"residue_index": i + 1, "sasa": round(sasa[i], 1), "plddt": round(plddt[i], 1)})
+    print(f"Raw candidates found: {len(candidates)}")
+    print(f"Candidate residue indices: {[c['residue_index'] for c in candidates]}")
     linear_epitopes = group_linear_epitopes(candidates)
     glyco_sites = find_glycosylation_sites(sequence)
-
+    epitope_scores = compute_epitope_scores(sequence, sasa, plddt)
+    ranked_candidates = sorted(
+        [{"residue_index": i + 1, "score": epitope_scores[i], "sasa": round(sasa[i], 1), "plddt": round(plddt[i], 2)}
+         for i in range(len(epitope_scores))],
+        key=lambda x: x["score"], reverse=True
+    )[:15]
     for epi in linear_epitopes:
-        epi["glycan_overlap"] = any(epi["start"] <= g <= epi["end"] for g in glyco_sites)
-
+            epi["glycan_overlap"] = any(epi["start"] <= g <= epi["end"] for g in glyco_sites)
     return {
-        "predicted_pdb": predicted_pdb,
-        "residue_candidates": candidates,
-        "linear_epitopes": linear_epitopes,
-        "glycosylation_sites": glyco_sites,
-    }
+            "predicted_pdb": predicted_pdb,
+            "residue_candidates": candidates,
+            "linear_epitopes": linear_epitopes,
+            "glycosylation_sites": glyco_sites,
+            "ranked_candidates": ranked_candidates
+        }
 
+    
 
 # ---------------------------------------------------------------------------
 # Batch benchmarking (CSV export)
@@ -711,14 +829,21 @@ if st.button("Run Benchmark"):
     results = []
     for pdb_id in [p.strip() for p in pdb_ids.split(",") if p.strip()]:
         with st.spinner(f"Processing {pdb_id}..."):
-            chain_results = benchmark_all_chains(pdb_id)
-            for r in chain_results:
-                results.append({
-                    "PDB ID": pdb_id,
-                    "RMSD": r.rmsd,
-                    "TM-score": r.tm_score,
-                    "Error": r.error or "",
-                })
+                try:
+                    chain_results = benchmark_all_chains(pdb_id)
+                except RuntimeError as e:
+                    if "504" in str(e) or "timed out" in str(e).lower() or "ReadTimeout" in str(e):
+                        st.error(f"RCSB PDB servers appear to be down or unresponsive right now for {pdb_id}.")
+                    else:
+                        st.error(f"Failed to benchmark {pdb_id}: {e}")
+                    chain_results = []
+                for r in chain_results:
+                    results.append({
+                        "PDB ID": pdb_id,
+                        "RMSD": r.rmsd,
+                        "TM-score": r.tm_score,
+                        "Error": r.error or "",
+                    })
     st.session_state["benchmark_results"] = results
 
 if "benchmark_results" in st.session_state:
@@ -783,6 +908,12 @@ if raw_sequence and raw_sequence.strip():
         f"{note}"
     )
 
+    col1, col2 = st.columns(2)
+    with col1:
+        min_length_ui = st.slider("Minimum epitope region length", min_value=2, max_value=10, value=5)
+    with col2:
+        max_gap_ui = st.slider("Maximum gap between residues", min_value=0, max_value=5, value=1)
+
 manual_run = st.button("Analyze Sequence")
 auto_run = st.session_state.pop("auto_triggered_pdb", None) is not None
 
@@ -793,12 +924,25 @@ if manual_run or auto_run:
         st.error("Please enter a valid amino acid sequence (standard 20 amino acid letters only).")
     else:
         with st.spinner("Predicting structure and scanning for epitope candidates..."):
-            analysis = analyze_novel_sequence(cleaned_sequence)
+            analysis = analyze_novel_sequence(cleaned_sequence, min_length=min_length_ui, max_gap=max_gap_ui)
         st.session_state["novel_analysis_result"] = analysis
 
 if "novel_analysis_result" in st.session_state:
     analysis = st.session_state["novel_analysis_result"]
-    st.subheader(f"Found {len(analysis['linear_epitopes'])} candidate linear epitope regions")
+    n_grouped = len(analysis["linear_epitopes"])
+    n_individual = len(analysis["residue_candidates"])
+
+    if n_grouped > 0:
+        st.subheader(f"Found {n_grouped} candidate linear epitope regions "
+                     f"({n_individual} individual surface-exposed, high-confidence residues)")
+    elif analysis.get("ranked_candidates"):
+        st.subheader(f"No contiguous epitope regions found — showing top {len(analysis['ranked_candidates'])} ranked candidate residues instead")
+    else:
+        st.subheader("No candidate epitope residues found")
+    if len(analysis["linear_epitopes"]) == 0 and analysis.get("ranked_candidates"):
+        st.info("No contiguous 5+ residue stretches passed the strict threshold. Showing top-ranked individual residues by combined epitope propensity score instead:")
+        for rc in analysis["ranked_candidates"]:
+            st.write(f"Residue {rc['residue_index']}: score={rc['score']} (SASA={rc['sasa']}, pLDDT={rc['plddt']})")
     for epi in analysis["linear_epitopes"]:
         flag = " ⚠️ overlaps predicted glycosylation site" if epi["glycan_overlap"] else ""
         st.write(f"Residues {epi['start']}–{epi['end']} (length {epi['length']}){flag}")
@@ -810,5 +954,9 @@ if "novel_analysis_result" in st.session_state:
     for epi in analysis["linear_epitopes"]:
         color = "orange" if epi["glycan_overlap"] else "red"
         view.addStyle({"resi": f"{epi['start']}-{epi['end']}"}, {"cartoon": {"color": color}})
+    if len(analysis["linear_epitopes"]) == 0 and analysis.get("ranked_candidates"):
+        for rc in analysis["ranked_candidates"]:
+            view.addStyle({"resi": str(rc["residue_index"])}, {"cartoon": {"color": "blue"}})
     view.zoomTo()
     st.iframe(view._make_html(), height=470)
+    
