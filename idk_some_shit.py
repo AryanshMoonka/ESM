@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import List, Optional
 import hashlib
 import os
-
 import numpy as np
 import requests
 import streamlit as st
@@ -19,6 +18,7 @@ from Bio.PDB.Chain import Chain
 from Bio.PDB.Model import Model
 from Bio.PDB.SASA import ShrakeRupley
 from Bio.PDB.Structure import Structure
+from difflib import SequenceMatcher
 
 THREE_TO_ONE = {
     "ALA":"A","ARG":"R","ASN":"N","ASP":"D","CYS":"C","GLN":"Q","GLU":"E",
@@ -475,32 +475,40 @@ def benchmark_one(pdb_id: str) -> BenchmarkResult:
 def benchmark_one_chain(pdb_id: str, chain: str) -> BenchmarkResult:
     print(f"[{pdb_id}:{chain}] fetching experimental structure...")
     experimental_pdb = fetch_experimental_pdb(pdb_id)
-    experimental_coords = extract_ca_coordinates(experimental_pdb, chain=chain)
+    obs_seq, experimental_coords = extract_ca_residues(experimental_pdb, chain)
 
     print(f"[{pdb_id}:{chain}] fetching sequence...")
-    sequence = fetch_sequence(pdb_id)
+    sequence = fetch_sequence(pdb_id, chain=chain)
     if not sequence:
         return BenchmarkResult(pdb_id, 0, float("nan"), float("nan"),
-                                error="Could not retrieve sequence")
+                               error="Could not retrieve sequence")
 
     print(f"[{pdb_id}:{chain}] requesting ESMFold prediction ({len(sequence)} residues)...")
     predicted_pdb = predict_structure(sequence)
     predicted_coords = extract_ca_coordinates(predicted_pdb)
 
-    length = min(len(experimental_coords), len(predicted_coords))
-    if length == 0:
-        return BenchmarkResult(pdb_id, len(sequence), float("nan"), float("nan"),
-                                error="No matching CA atoms found")
+    sm = SequenceMatcher(None, sequence, obs_seq, autojunk=False)
+    pi, ei = [], []
+    for a, b, size in sm.get_matching_blocks():
+        pi.extend(range(a, a + size))
+        ei.extend(range(b, b + size))
+    pi, ei = np.array(pi, dtype=int), np.array(ei, dtype=int)
+    keep = pi < len(predicted_coords)
+    pi, ei = pi[keep], ei[keep]
 
-    exp_trimmed = experimental_coords[:length]
-    pred_trimmed = predicted_coords[:length]
+    length = len(pi)
+    if length < 20 or length < 0.5 * len(obs_seq):
+        return BenchmarkResult(pdb_id, len(sequence), float("nan"), float("nan"),
+                               error="Sequence/structure alignment too short")
+
+    exp_trimmed = experimental_coords[ei]
+    pred_trimmed = predicted_coords[pi]
 
     rmsd = kabsch_rmsd(exp_trimmed, pred_trimmed)
     tm = tm_score(exp_trimmed, pred_trimmed, target_length=length)
 
     print(f"[{pdb_id}:{chain}] RMSD = {rmsd:.2f} Å, TM-score = {tm:.3f}")
     return BenchmarkResult(pdb_id, len(sequence), rmsd, tm)
-
 
 def benchmark_all_chains(pdb_id: str) -> list:
     """Benchmarks only protein chains — DNA/RNA chains are skipped since
@@ -514,16 +522,50 @@ def benchmark_all_chains(pdb_id: str) -> list:
             print(f"[{pdb_id}:{c}] FAILED: {exc}")
     return results
 
+_AA3 = {"ALA":"A","ARG":"R","ASN":"N","ASP":"D","CYS":"C","GLN":"Q","GLU":"E",
+        "GLY":"G","HIS":"H","ILE":"I","LEU":"L","LYS":"K","MET":"M","PHE":"F",
+        "PRO":"P","SER":"S","THR":"T","TRP":"W","TYR":"Y","VAL":"V","MSE":"M"}
+
+def extract_ca_residues(pdb_text, chain):
+    """One-letter sequence and CA coords of the resolved residues of one chain.
+    First model only, first altloc only."""
+    seq, coords, seen = [], [], set()
+    for line in pdb_text.splitlines():
+        if line.startswith("ENDMDL"):
+            break
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            continue
+        if line[12:16].strip() != "CA" or line[21].strip() != chain:
+            continue
+        if line[16] not in (" ", "A"):
+            continue
+        resname = line[17:20].strip()
+        if line.startswith("HETATM") and resname != "MSE":
+            continue
+        rid = (line[22:26], line[26])
+        if rid in seen:
+            continue
+        seen.add(rid)
+        seq.append(_AA3.get(resname, "X"))
+        coords.append((float(line[30:38]), float(line[38:46]), float(line[46:54])))
+    return "".join(seq), np.array(coords, dtype=float)
 
 def get_chain_prediction(pdb_id: str, chain: str):
     experimental_pdb = fetch_experimental_pdb(pdb_id)
-    exp_coords = extract_ca_coordinates(experimental_pdb, chain=chain)
+    obs_seq, exp_coords = extract_ca_residues(experimental_pdb, chain)
     sequence = fetch_sequence(pdb_id, chain=chain)
     predicted_pdb = predict_structure(sequence)
     pred_coords = extract_ca_coordinates(predicted_pdb)
-    length = min(len(exp_coords), len(pred_coords))
-    return exp_coords[:length], pred_coords[:length]
 
+    sm = SequenceMatcher(None, sequence, obs_seq, autojunk=False)
+    pi, ei = [], []
+    for a, b, size in sm.get_matching_blocks():
+        pi.extend(range(a, a + size))
+        ei.extend(range(b, b + size))
+    pi, ei = np.array(pi, dtype=int), np.array(ei, dtype=int)
+    keep = pi < len(pred_coords)
+    pi, ei = pi[keep], ei[keep]
+    return exp_coords[ei], pred_coords[pi]
 
 def benchmark_quaternary(pdb_id: str):
     chain_ids = get_chain_ids(pdb_id)
