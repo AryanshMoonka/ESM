@@ -1,4 +1,4 @@
-##Copyright Reserved (2026) by Aryansh Moonka. All rights reserved. Unathorized copying, distribution, or modifications of this file, via any medium is strictly prohibited. Proprietary and confidential.
+##Copyright Reserved (C) (2026) by Aryansh Moonka. All rights reserved. Unathorized copying, distribution, or modifications of this file, via any medium is strictly prohibited. Proprietary and confidential.
 
 import csv
 import io
@@ -19,6 +19,25 @@ from Bio.PDB.Chain import Chain
 from Bio.PDB.Model import Model
 from Bio.PDB.SASA import ShrakeRupley
 from Bio.PDB.Structure import Structure
+
+THREE_TO_ONE = {
+    "ALA":"A","ARG":"R","ASN":"N","ASP":"D","CYS":"C","GLN":"Q","GLU":"E",
+    "GLY":"G","HIS":"H","ILE":"I","LEU":"L","LYS":"K","MET":"M","PHE":"F",
+    "PRO":"P","SER":"S","THR":"T","TRP":"W","TYR":"Y","VAL":"V"
+}
+
+def sequence_from_atoms(pdb_text: str, chain: str) -> str:
+    """Build a sequence directly from ATOM CA records for a given chain, avoiding fragile FASTA header parsing."""
+    seen = {}
+    for line in pdb_text.splitlines():
+        if line.startswith("ATOM") and line[21].strip() == chain:
+            atom_name = line[12:16].strip()
+            if atom_name == "CA":
+                resi = int(line[22:26])
+                resn = line[17:20].strip()
+                if resn in THREE_TO_ONE:
+                    seen[resi] = THREE_TO_ONE[resn]
+    return "".join(seen[k] for k in sorted(seen))
 
 # ---------------------------------------------------------------------------
 # Config / constants
@@ -601,7 +620,8 @@ def extract_plddt(pdb_text: str, chain: str = None):
 
 def find_epitope_candidates(pdb_id: str, chain: str, sasa_threshold=30.0, plddt_threshold=0.7):
     """Flag residues that are both surface-exposed AND confidently predicted."""
-    sequence = fetch_sequence(pdb_id, chain=chain)
+    experimental_pdb = fetch_experimental_pdb(pdb_id)
+    sequence = sequence_from_atoms(experimental_pdb, chain)
     predicted_pdb = predict_structure(sequence)
     sasa = compute_sasa(predicted_pdb, chain=None)  # predicted structure is single-chain
     print(f"SASA raw values: {sasa[:10]}")
@@ -793,14 +813,7 @@ def show_quaternary_structure(pdb_id):
 
 
 # ---------------------------------------------------------------------------
-# Streamlit UI
-# NOTE: this file is meant to be launched with `streamlit run idk_some_shit.py`.
-# There is deliberately no `if __name__ == "__main__": run_benchmark(...)`
-# block here -- streamlit sets __name__ == "__main__" on every rerun too,
-# which would silently re-run the full default benchmark on every single
-# UI interaction. To run the CLI batch benchmark instead, use a separate
-# script that imports this module and calls run_benchmark(PROTEIN_LIST)
-# directly, or run it from a Python shell.
+# Streamlit
 # ---------------------------------------------------------------------------
 st.title("ESMFold Benchmarking Pipeline")
 
